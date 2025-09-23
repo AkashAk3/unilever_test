@@ -15,39 +15,69 @@ executor = ThreadPoolExecutor(max_workers=2)
 
 async def fetch_html(url):
     """
-    Scrape the full HTML content from a given URL using Playwright Async API.
-    Returns the HTML content as a string.
+    Scrape the full HTML content from a given URL using Playwright Async API with retries.
+    Falls back to requests if Playwright fails. Returns HTML as string or None.
     """
     from playwright.async_api import async_playwright
+    user_agent = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    )
+    extra_headers = {
+        "Accept-Language": "en-US,en;q=0.9",
+        "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+    for attempt in range(3):
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True, args=["--disable-gpu", "--no-sandbox"])
+                context = await browser.new_context(
+                    user_agent=user_agent,
+                    viewport={"width": 1366, "height": 768},
+                    java_script_enabled=True,
+                    ignore_https_errors=True,
+                    locale="en-US",
+                )
+                await context.set_extra_http_headers(extra_headers)
+
+                page = await context.new_page()
+                page.set_default_timeout(60000)
+
+                await page.goto(url, wait_until='domcontentloaded', timeout=60000)
+                try:
+                    await page.wait_for_load_state('networkidle', timeout=60000)
+                except Exception:
+                    pass
+
+                # Small scroll to trigger lazy content
+                try:
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await asyncio.sleep(0.5)
+                except Exception:
+                    pass
+
+                html_content = await page.content()
+                await browser.close()
+                print(f"✅ HTML fetched successfully with Playwright (len={len(html_content)})")
+                return html_content
+        except Exception as e:
+            print(f"⚠️ Playwright attempt {attempt+1} failed: {e}")
+            await asyncio.sleep(1)
+
+    # Fallback to requests
     try:
-        async with async_playwright() as p:
-            # Launch a headless browser
-            # logger.info(f"Launching browser and navigating to {url}")
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context()
-
-            # Create page and navigate
-            page = await context.new_page()
-            page.set_default_timeout(30000)
-
-            # Navigate to URL and wait for content
-            await page.goto(url, wait_until='networkidle', timeout=30000)
-
-            # Wait for page to fully load
-            time.sleep(3)
-
-            # Get the full HTML content
-            html_content = await page.content()
-
-            # Close browser
-            await browser.close()
-
-            print(f"✅ HTML fetched successfully with Playwright ({len(html_content)} characters)")
-            return html_content
+        print("🔁 Falling back to requests for HTML fetch")
+        resp = requests.get(url, headers={"User-Agent": user_agent, **extra_headers}, timeout=20)
+        if resp.status_code == 200 and resp.text:
+            print(f"✅ HTML fetched successfully with requests (len={len(resp.text)})")
+            return resp.text
+        print(f"❌ Requests fallback failed with status {resp.status_code}")
     except Exception as e:
-        # logger.error(f"Error scraping {url}: {str(e)}")
-        print("error scrapping")
-        return None
+        print(f"❌ Requests fallback error: {e}")
+    return None
 
 def extract_internal_links(html_content, base_url):
     soup = BeautifulSoup(html_content, 'html.parser')
@@ -60,9 +90,58 @@ def extract_internal_links(html_content, base_url):
         full_url = urljoin(base_url, href)
         parsed_href = urlparse(full_url)
         if parsed_href.netloc == base_domain and parsed_href.scheme in ('http', 'https'):
-            internal_links.add(full_url)
+            internal_links.add(normalize_url(full_url))
     print(f"Found {len(internal_links)} internal links")
     return list(internal_links)
+
+def normalize_url(url):
+    parsed = urlparse(url)
+    # Remove fragment and normalize path (strip trailing slash except root)
+    path = parsed.path.rstrip('/') if parsed.path != '/' else parsed.path
+    normalized = parsed._replace(fragment='', query=parsed.query, path=path)
+    return normalized.geturl()
+
+async def crawl_internal_links_recursive(start_url, max_consecutive_no_new=5):
+    """Recursively crawl internal links starting from start_url.
+    Stop when 5 consecutive page visits yield no new internal links.
+    Returns a list of unique internal URLs (set semantics).
+    """
+    base_domain = urlparse(start_url).netloc
+    to_visit = [normalize_url(start_url)]
+    visited = set()
+    discovered = set()
+    consecutive_no_new = 0
+
+    while to_visit and consecutive_no_new < max_consecutive_no_new:
+        current = to_visit.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+
+        html = await fetch_html(current)
+        if html is None:
+            consecutive_no_new += 1
+            continue
+
+        links = extract_internal_links(html, start_url)
+        normalized_links = []
+        for link in links:
+            # Ensure same domain (safety, though extract_internal_links already checks)
+            if urlparse(link).netloc == base_domain:
+                normalized_links.append(normalize_url(link))
+
+        new_links = [l for l in normalized_links if l not in visited and l not in discovered]
+
+        if new_links:
+            consecutive_no_new = 0
+        else:
+            consecutive_no_new += 1
+
+        for l in new_links:
+            discovered.add(l)
+            to_visit.append(l)
+
+    return list(discovered)
 
 def process_single_link_with_context(link, app):
     """Process a single link within Flask app context"""
@@ -409,8 +488,8 @@ async def scrape_and_process(url):
         if html is None:
             return json.dumps({"error": "Failed to fetch URL"})
 
-        # Extract internal links
-        internal_links = extract_internal_links(html, url)
+        # Extract internal links recursively (deduped set semantics)
+        internal_links = await crawl_internal_links_recursive(url)
         if not internal_links:
             return json.dumps({"error": "No internal links found"})
 
