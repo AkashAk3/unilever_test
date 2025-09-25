@@ -25,9 +25,16 @@ class ParallelURLExtractor:
     def get_internal_urls(self, url, base_domain):
         """Extract all internal URLs from a given URL"""
         try:
-            response = self.session.get(url, timeout=10)
+            print("before request",url)
+            headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,/;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept-Language': 'en-US,en;q=0.9',
+        # Add other relevant headers from your browser
+    }
+            response = self.session.get(url, headers=headers ,timeout=500)
             response.raise_for_status()
-            
+            print("at line 30",response)
             soup = BeautifulSoup(response.content, 'html.parser')
             internal_urls = set()
             
@@ -173,7 +180,10 @@ class ParallelURLExtractor:
 
 def main():
     start_url = "https://www.unilever.com/"
-    
+    start_url = "https://www.degreedeodorant.com/us/en/home.html"
+    # start_url="http://quebrandobarreiras.rexona.com.br/"
+    start_url= "https://www.tanyapepsodent.com/"
+    # start_url ="https://breakinglimits.degreedeodorant.com/en-US"
     # Configuration
     max_workers = 15      # Number of parallel threads
     batch_size = 25       # URLs to process per batch
