@@ -172,7 +172,7 @@ class ParallelURLExtractor:
         return self.all_urls
 
 def main():
-    start_url = "https://www.unilever.com/"
+    start_url = "https://www.tanyapepsodent.com/home.html"
     
     # Configuration
     max_workers = 15      # Number of parallel threads
