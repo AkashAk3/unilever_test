@@ -1,6 +1,7 @@
 # unilever_scraper.py
 import asyncio
 import json
+import logging
 import time
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright
@@ -9,6 +10,44 @@ from playwright.async_api import async_playwright
 HEADLESS = True           # set False while debugging if you want to see the browser
 OUTPUT_FILE = "deep_scraped_content_dove.json"
 NAV_TIMEOUT = 60000      # ms
+
+
+headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,/;q=0.8,application/signed-exchange;v=b3;q=0.7',
+    'Accept-Language': 'en-US,en;q=0.9',
+    # Add other relevant headers from your browser
+}
+
+
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s"
+)
+logger = logging.getLogger("deep_analysis")
+
+
+def build_headers(target_url: str) -> dict:
+    """Return realistic navigation headers including Referer and Client Hints."""
+    try:
+        parsed = urlparse(target_url)
+        referer = "https://www.google.com/"
+        # For same-site subsequent requests, you could use f"{parsed.scheme}://{parsed.netloc}/"
+    except Exception:
+        referer = "https://www.google.com/"
+
+    merged = dict(headers)
+    merged.setdefault('Referer', referer)
+    merged.setdefault('sec-ch-ua', '"Chromium";v="123", "Not:A-Brand";v="99"')
+    merged.setdefault('sec-ch-ua-mobile', '?0')
+    merged.setdefault('sec-ch-ua-platform', '"Windows"')
+    merged.setdefault('sec-fetch-dest', 'document')
+    merged.setdefault('sec-fetch-mode', 'navigate')
+    merged.setdefault('sec-fetch-site', 'none')
+    merged.setdefault('sec-fetch-user', '?1')
+    merged.setdefault('upgrade-insecure-requests', '1')
+    return merged
 
 
 async def auto_scroll(page):
@@ -29,7 +68,7 @@ async def auto_scroll(page):
             }"""
         )
     except Exception:
-        pass
+        logger.debug("auto_scroll: ignore scroll script failure", exc_info=True)
 
 
 async def extract_structured_content(page):
@@ -41,6 +80,7 @@ async def extract_structured_content(page):
     - For card-style containers with .uol-c-card__title/.uol-c-card__body, extracts directly if no <h*> present.
     - De-duplicates headings (keeps first occurrence).
     """
+    logger.debug("inside extract_structured_content")
     js = r"""
     () => {
       const containers = Array.from(document.querySelectorAll(
@@ -131,54 +171,126 @@ async def extract_structured_content(page):
     """
     try:
         result = await page.evaluate(js)
+        logger.debug("JS extraction returned %d blocks", len(result) if isinstance(result, list) else -1)
         return result or []
-    except Exception as e:
-        print("❌ JS extraction failed:", e)
+    except Exception:
+        logger.exception("JS extraction failed")
         return []
 
 
 async def scrape_single_page(url):
+    logger.debug("inside scrape_single_page")
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=HEADLESS,
-                                          args=["--disable-blink-features=AutomationControlled"])
-        context = await browser.new_context()
-        page = await context.new_page()
-        page.set_default_navigation_timeout(NAV_TIMEOUT)
-
-        print(f"🌍 Visiting {url}")
+        browser = None
+        context = None
+        page = None
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
-        except Exception as e:
-            print("⚠️ initial navigation timed out or failed:", e)
+            browser = await p.chromium.launch(
+                headless=HEADLESS,
+                args=["--disable-blink-features=AutomationControlled"]
+            )
+            req_headers = build_headers(url)
+            context = await browser.new_context(
+                user_agent=req_headers.get('User-Agent'),
+                extra_http_headers=req_headers,
+                locale='en-US',
+                timezone_id='UTC'
+            )
+            page = await context.new_page()
+            page.set_default_navigation_timeout(NAV_TIMEOUT)
 
-        # give lazy JS a short time then scroll
-        await page.wait_for_timeout(800)
-        await auto_scroll(page)
-        # wait a bit for lazy content to load after scroll
-        await page.wait_for_timeout(1200)
+            logger.info("Visiting %s", url)
+            # Try navigation with brief retries to mitigate transient bot checks
+            attempts = 3
+            nav_response = None
+            for attempt in range(1, attempts + 1):
+                try:
+                    nav_response = await page.goto(
+                        url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT
+                    )
+                except Exception:
+                    logger.exception("Navigation attempt %d failed", attempt)
+                    nav_response = None
 
-        data = await extract_structured_content(page)
+                # Validate navigation response
+                ok = False
+                try:
+                    if nav_response is not None:
+                        status_code = nav_response.status
+                        ok = isinstance(status_code, int) and status_code < 400
+                except Exception:
+                    logger.debug("Unable to read navigation response/status", exc_info=True)
 
-        # pretty-print / logging per-heading
-        print(f"\n🧾 Extracted {len(data)} heading blocks:")
-        for i, item in enumerate(data, start=1):
-            h = item.get("heading") or ""
-            c = item.get("content") or ""
-            print(f"[{i}] {h!r} (content length = {len(c)})")
+                if ok:
+                    break
+                if attempt < attempts:
+                    wait_ms = 1000 * attempt
+                    logger.warning(
+                        "Nav not OK (resp=%s). Retrying in %d ms...",
+                        getattr(nav_response, 'status', None), wait_ms
+                    )
+                    await page.wait_for_timeout(wait_ms)
+            # Final check
+            if nav_response is None:
+                logger.error("No response received for URL: %s", url)
+                return []
+            try:
+                status_code = nav_response.status
+                if isinstance(status_code, int) and status_code >= 400:
+                    logger.error("HTTP %s received for URL: %s", status_code, url)
+                    return []
+            except Exception:
+                logger.debug("Unable to read final navigation status", exc_info=True)
 
-        # save results
-        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            # give lazy JS a short time then scroll
+            await page.wait_for_timeout(800)
+            await auto_scroll(page)
+            # wait a bit for lazy content to load after scroll
+            await page.wait_for_timeout(1200)
 
-        print(f"\n✅ Saved {len(data)} blocks to {OUTPUT_FILE}")
+            data = await extract_structured_content(page)
 
-        await browser.close()
-        return data
+            # per-heading log summary
+            logger.info("Extracted %d heading blocks", len(data))
+            for i, item in enumerate(data, start=1):
+                heading_text = item.get("heading") or ""
+                content_text = item.get("content") or ""
+                logger.debug("[%d] %r (content length = %d)", i, heading_text, len(content_text))
+
+            # save results
+            try:
+                with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                logger.info("Saved %d blocks to %s", len(data), OUTPUT_FILE)
+            except Exception:
+                logger.exception("Failed to write output file: %s", OUTPUT_FILE)
+
+            return data
+        except Exception:
+            logger.exception("Unhandled error during scrape_single_page")
+            return []
+        finally:
+            # best-effort cleanup
+            try:
+                if page is not None:
+                    await page.close()
+            except Exception:
+                logger.debug("Ignoring page.close error", exc_info=True)
+            try:
+                if context is not None:
+                    await context.close()
+            except Exception:
+                logger.debug("Ignoring context.close error", exc_info=True)
+            try:
+                if browser is not None:
+                    await browser.close()
+            except Exception:
+                logger.debug("Ignoring browser.close error", exc_info=True)
 
 
 if __name__ == "__main__":
     # Change this to the page you want to scrape.
-    url = "https://www.degreedeodorant.com/us/en/home.html"
+    url = "https://www.tanyapepsodent.com/"
     start = time.time()
     asyncio.run(scrape_single_page(url))
-    print(f"Elapsed: {time.time() - start:.1f}s")
+    logging.info("Elapsed: %.1fs", time.time() - start)
