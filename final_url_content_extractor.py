@@ -1,270 +1,290 @@
-# combined_scraper.py - URL Extraction + Deep Content Scraping
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+combined_scraper.py
+===================
+
+A full‑stack URL extractor + content scraper that
+
+* extracts all internal URLs from a domain
+* visits each page with Playwright (single shared context)
+* extracts heading‑content blocks via a tiny JS snippet
+* writes incremental and final JSON files
+* logs progress in real time and handles Ctrl‑C cleanly
+"""
+
 import asyncio
 import json
 import logging
+import os
+import sys
 import time
 import threading
-from urllib.parse import urljoin, urlparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
-import requests
-from bs4 import BeautifulSoup
-import urllib3
-from playwright.async_api import async_playwright
-import os
 from datetime import datetime
-import sys
+from urllib.parse import urljoin, urlparse
 
-# Disable SSL warnings
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import requests
+import urllib3
+from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from playwright.async_api import async_playwright
 
-# Configuration - Use exact same settings as working URL extraction file
+
+# urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+# --------------------------------------------------------------------
+#  CONFIGURATION
+# --------------------------------------------------------------------
 CONFIG = {
-    'url_extraction': {
-        'max_workers': 15,     # Same as working file
-        'batch_size': 25,      # Same as working file
-        'delay': 0.05,         # Same as working file
-        'timeout': 500,        # Same as working file (was 30 in combined)
-        'max_urls': 10000
+    "url_extraction": {
+        "max_workers": 15,
+        "batch_size": 25,
+        "delay": 0.05,
+        "timeout": 500,
+        "max_urls": 10_000,
     },
-    'content_scraping': {
-        'headless': True,
-        'nav_timeout': 60000,
-        'max_concurrent': 3,
-        'delay_between_pages': 2.0,
-        'retry_attempts': 3
+    "content_scraping": {
+        "headless": True,
+        "nav_timeout": 60_000,
+        "max_concurrent": 3,
+        "delay_between_pages": 2.0,
+        "retry_attempts": 3,
     },
-    'output': {
-        'incremental_save': True,
-        'incremental_file': 'scraped_content_incremental.json',
-        'final_file': 'scraped_content_final.json',
-        'failed_urls_file': 'failed_urls.json'
-    }
+    "output": {
+        "incremental_save": True,
+        "incremental_file": "scraped_content_incremental.json",
+        "final_file": "scraped_content_final.json",
+        "failed_urls_file": "failed_urls.json",
+    },
 }
 
-# Logging setup - Windows-compatible (no emoji)
-import sys
-
-# Create custom logger to avoid encoding issues
+# --------------------------------------------------------------------
+#  LOGGING
+# --------------------------------------------------------------------
 logger = logging.getLogger("combined_scraper")
 logger.setLevel(logging.INFO)
 
-# File handler with UTF-8 encoding
-file_handler = logging.FileHandler('scraping.log', encoding='utf-8')
-file_formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
-file_handler.setFormatter(file_formatter)
+file_handler = logging.FileHandler("scraping.log", encoding="utf-8")
+file_handler.setFormatter(
+    logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
+)
 
-# Console handler with default encoding
 console_handler = logging.StreamHandler(sys.stdout)
-console_formatter = logging.Formatter("%(asctime)s %(levelname)s - %(message)s")
-console_handler.setFormatter(console_formatter)
+console_handler.setFormatter(
+    logging.Formatter("%(asctime)s %(levelname)s - %(message)s")
+)
 
-# Add handlers
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
-
+# --------------------------------------------------------------------
+#  URL EXTRACTOR
+# --------------------------------------------------------------------
 class URLExtractor:
-    """Extracts all internal URLs from a domain"""
-    
+    """Walk a domain and collect every internal URL."""
+
     def __init__(self, config):
         self.config = config
         self.session = requests.Session()
         self.session.verify = False
+        self.session.headers.update(self._default_headers())
+
         self.all_urls = set()
         self.processed = set()
         self.lock = threading.Lock()
-        
-        # Use exact same headers as working URL extraction file
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,/;q=0.8,application/signed-exchange;v=b3;q=0.7',
-            'Accept-Language': 'en-US,en;q=0.9',
+
+    @staticmethod
+    def _default_headers():
+        return {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0.0.0 Safari/537.36"
+            ),
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;"
+                "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,"
+                "application/signed-exchange;v=b3;q=0.7"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
         }
-    
-    def get_internal_urls(self, url, base_domain):
-        """Extract all internal URLs from a given URL - Same logic as working separate file"""
+
+    def _is_file(self, url: str) -> bool:
+        return url.lower().endswith(
+            (
+                ".pdf", ".ppt", ".pptx", ".doc", ".docx",
+                ".xls", ".xlsx", ".zip", ".rar",
+                ".jpg", ".jpeg", ".png", ".gif",
+                ".mp4", ".avi", ".mp3",
+            )
+        )
+
+    def get_internal_urls(self, url: str, base_domain: str) -> set:
         try:
-            print("before request", url)
-            
-            # Use exact same approach as working file
-            response = self.session.get(url, headers=self.headers, timeout=500)
+            response = self.session.get(url, timeout=self.config["timeout"])
             response.raise_for_status()
-            print("at line 30", response)
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            internal_urls = set()
-            
-            # Find all links - exact same logic as working file
-            for link in soup.find_all('a', href=True):
-                href = link['href']
-                # Convert relative URLs to absolute
+
+            soup = BeautifulSoup(response.content, "html.parser")
+            internal = set()
+
+            for link in soup.find_all("a", href=True):
+                href = link["href"]
                 full_url = urljoin(url, href)
-                
-                # Check if URL belongs to the same domain
-                parsed_url = urlparse(full_url)
-                if parsed_url.netloc == base_domain:
-                    if full_url.lower().endswith(('.pdf', '.ppt', '.pptx', '.doc', '.docx', 
-                                                '.xls', '.xlsx', '.zip', '.rar', '.jpg', 
-                                                '.jpeg', '.png', '.gif', '.mp4', '.avi', '.mp3')):
-                        continue
-                    # Clean URL (remove fragments)
-                    clean_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-                    if parsed_url.query:
-                        clean_url += f"?{parsed_url.query}"
-                    internal_urls.add(clean_url)
-            
-            # Small delay to be respectful
-            if self.config['delay'] > 0:
-                time.sleep(self.config['delay'])
-            
-            return internal_urls
-            
-        except Exception as e:
-            print(f"Error fetching {url}: {e}")
+                parsed = urlparse(full_url)
+
+                if parsed.netloc != base_domain or self._is_file(full_url):
+                    continue
+
+                clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                if parsed.query:
+                    clean += f"?{parsed.query}"
+                internal.add(clean)
+
+            if self.config["delay"] > 0:
+                time.sleep(self.config["delay"])
+
+            return internal
+        except Exception as exc:
+            logger.exception("Error fetching %s – %s", url, exc)
             return set()
-    
+
     def process_batch(self, urls_batch, base_domain):
-        """Process a batch of URLs in parallel"""
         new_urls = set()
-        
-        with ThreadPoolExecutor(max_workers=self.config['max_workers']) as executor:
-            future_to_url = {
-                executor.submit(self.get_internal_urls, url, base_domain): url 
-                for url in urls_batch
+        with ThreadPoolExecutor(max_workers=self.config["max_workers"]) as executor:
+            futures = {
+                executor.submit(self.get_internal_urls, u, base_domain): u
+                for u in urls_batch
             }
-            
-            for future in as_completed(future_to_url):
-                url = future_to_url[future]
+            for future in as_completed(futures):
+                url = futures[future]
                 try:
-                    urls_found = future.result()
-                    
+                    found = future.result()
                     with self.lock:
                         self.processed.add(url)
-                        truly_new = urls_found - self.all_urls
+                        truly_new = found - self.all_urls
                         new_urls.update(truly_new)
-                        self.all_urls.update(urls_found)
-                    
-                    print(f"✓ Processed: {url} ({len(urls_found)} URLs found)")
-                    
-                except Exception as e:
-                    print(f"✗ Failed: {url} - {e}")
+                        self.all_urls.update(found)
+                    logger.debug("✓ %s – %d found", url, len(found))
+                except Exception as exc:
+                    logger.error("✗ %s – %s", url, exc)
                     with self.lock:
                         self.processed.add(url)
-        
         return new_urls
-    
+
     def extract_all_urls(self, start_url):
-        """Extract all URLs from the domain"""
         parsed_start = urlparse(start_url)
         base_domain = parsed_start.netloc
-        
+
         to_process = deque([start_url])
         iteration = 0
         last_5_counts = []
-        
-        print(f"Starting parallel extraction from: {start_url}")
-        print(f"Base domain: {base_domain}")
-        print(f"Max workers: {self.config['max_workers']}, Batch size: {batch_size}")
-        print("-" * 60)
-        
+
+        logger.info("Starting parallel extraction from: %s", start_url)
+        logger.info("Base domain: %s", base_domain)
+        logger.info(
+            "Max workers: %s, Batch size: %s",
+            self.config["max_workers"],
+            self.config["batch_size"],
+        )
+        logger.info("-" * 60)
+
         start_time = time.time()
-        
+
         while to_process:
             iteration += 1
-            
             current_batch = []
-            batch_count = min(self.config['batch_size'], len(to_process))
-            
+            batch_count = min(self.config["batch_size"], len(to_process))
+
             for _ in range(batch_count):
                 if to_process:
                     url = to_process.popleft()
                     if url not in self.processed:
                         current_batch.append(url)
-            
+
             if not current_batch:
                 break
-            
-            print(f"\nIteration {iteration}: Processing batch of {len(current_batch)} URLs")
-            iteration_start = time.time()
-            
+
+            logger.info("\nIteration %d: Processing batch of %d URLs", iteration, len(current_batch))
+            batch_start = time.time()
+
             new_urls = self.process_batch(current_batch, base_domain)
-            
+
             for url in new_urls:
                 if url not in self.processed:
                     to_process.append(url)
-            
+
             new_count = len(new_urls)
             last_5_counts.append(new_count)
-            
-            iteration_time = time.time() - iteration_start
-            
-            print(f"Batch completed in {iteration_time:.2f}s")
-            print(f"New URLs found: {new_count}")
-            print(f"Total unique URLs: {len(self.all_urls)}")
-            print(f"URLs in queue: {len(to_process)}")
-            
+
             if len(last_5_counts) > 5:
                 last_5_counts.pop(0)
-            
-            # Stopping conditions - same as working file
+
+            logger.info("Batch completed in %.2fs", time.time() - batch_start)
+            logger.info("New URLs found: %d", new_count)
+            logger.info("Total unique URLs: %d", len(self.all_urls))
+            logger.info("URLs in queue: %d", len(to_process))
+
             if len(last_5_counts) >= 3 and sum(last_5_counts[-3:]) == 0:
-                print("\nStopping: No new URLs found in last 3 iterations")
+                logger.info("\nStopping: No new URLs found in last 3 iterations")
                 break
-            
-            if len(self.all_urls) > self.config['max_urls']:
-                print(f"\nSafety limit reached: {len(self.all_urls)} URLs found")
+
+            if len(self.all_urls) > self.config["max_urls"]:
+                logger.warning("\nSafety limit reached: %d URLs found", len(self.all_urls))
                 break
-        
-        total_time = time.time() - start_time
-        print(f"\nExtraction completed in {total_time:.2f}s")
-        logger.info(f"URL extraction completed in {total_time:.2f}s")
-        logger.info(f"Total URLs extracted: {len(self.all_urls)}")
-        
+
+        logger.info("\nExtraction completed in %.2fs", time.time() - start_time)
         return sorted(self.all_urls)
 
-
+# --------------------------------------------------------------------
+#  CONTENT SCRAPER
+# --------------------------------------------------------------------
 class ContentScraper:
-    """Scrapes content from URLs using Playwright - Same logic as working deep analysis file"""
-    
+    """Scrape heading‑content blocks from every URL with Playwright."""
+
     def __init__(self, config):
         self.config = config
-        self.scraped_data = []
-        self.failed_urls = []
         self.lock = asyncio.Lock()
-        
-        # Use exact same headers as working deep analysis file
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,/;q=0.8,application/signed-exchange;v=b3;q=0.7',
-            'Accept-Language': 'en-US,en;q=0.9',
-        }
-    
-    def build_headers(self, target_url: str) -> dict:
-        """Return realistic navigation headers including Referer and Client Hints - Same as working file"""
-        try:
-            parsed = urlparse(target_url)
-            referer = "https://www.google.com/"
-        except Exception:
-            referer = "https://www.google.com/"
+        self.failed_urls = []
 
-        merged = dict(self.headers)
-        merged.setdefault('Referer', referer)
-        merged.setdefault('sec-ch-ua', '"Chromium";v="123", "Not:A-Brand";v="99"')
-        merged.setdefault('sec-ch-ua-mobile', '?0')
-        merged.setdefault('sec-ch-ua-platform', '"Windows"')
-        merged.setdefault('sec-fetch-dest', 'document')
-        merged.setdefault('sec-fetch-mode', 'navigate')
-        merged.setdefault('sec-fetch-site', 'none')
-        merged.setdefault('sec-fetch-user', '?1')
-        merged.setdefault('upgrade-insecure-requests', '1')
-        return merged
-    
-    async def auto_scroll(self, page):
-        """Slow scroll to trigger lazy loading - Same as working file"""
+        # Progress counters
+        self.total_to_scrape = 0
+        self.total_scraped = 0
+        self.total_failed = 0
+
+    @staticmethod
+    def _build_headers(target_url: str) -> dict:
+        return {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0.0.0 Safari/537.36"
+            ),
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;"
+                "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,"
+                "application/signed-exchange;v=b3;q=0.7"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.google.com/",
+            "sec-ch-ua": '"Chromium";v="123", "Not:A-Brand";v="99"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "none",
+            "sec-fetch-user": "?1",
+            "upgrade-insecure-requests": "1",
+        }
+
+    async def _auto_scroll(self, page):
+        """Slow scroll to trigger lazy loading."""
         try:
             await page.evaluate(
-                """async () => {
+                """
+                async () => {
                     const step = 300;
                     const delay = ms => new Promise(r => setTimeout(r, ms));
                     let pos = 0;
@@ -275,14 +295,14 @@ class ContentScraper:
                         await delay(200);
                     }
                     window.scrollTo(0,0);
-                }"""
+                }
+                """
             )
         except Exception:
             logger.debug("auto_scroll: ignore scroll script failure", exc_info=True)
-    
-    async def extract_structured_content(self, page):
-        """Extract structured content from the page - Same logic as working deep analysis file"""
-        logger.debug("inside extract_structured_content")
+
+    async def _extract_structured_content(self, page):
+        """Execute the JS snippet that returns heading‑content blocks."""
         js = r"""
         () => {
           const containers = Array.from(document.querySelectorAll(
@@ -292,11 +312,10 @@ class ContentScraper:
           const seen = new Set();
 
           function normalizeText(s){
-            return (s || "").replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
+              return (s || "").replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
           }
 
           for (const container of containers) {
-            // First, handle article cards that might not have <h*> but use .uol-c-card__title
             const cardTitle = container.querySelector(".uol-c-card__title");
             const isCard = container.tagName && container.tagName.toLowerCase() === "article" && cardTitle;
             if (isCard) {
@@ -307,49 +326,32 @@ class ContentScraper:
                 const content = body ? normalizeText(body.innerText) : normalizeText(container.innerText.replace(cardTitle.innerText, ""));
                 results.push({ heading: title, content: content });
               }
-              // still continue to next container (do not attempt generic headings inside card)
               continue;
             }
 
-            // For generic containers: gather headings in-order
-            const headings = Array.from(container.querySelectorAll("h1, h2, h3, h4, h5, h6"));
+            const headings = Array.from(container.querySelectorAll("h1,h2,h3,h4,h5,h6"));
             if (headings.length === 0) continue;
 
             for (let i = 0; i < headings.length; i++) {
               const h = headings[i];
               const headingText = normalizeText(h.innerText);
               if (!headingText || seen.has(headingText)) continue;
-              // Build a Range: from immediately after this heading to before the next heading in this container
+
               const range = document.createRange();
-              try {
-                range.setStartAfter(h);
-              } catch (e) {
-                // fallback: if can't set start after, continue
-                continue;
-              }
+              try { range.setStartAfter(h); } catch { continue; }
               const nextHeading = (i + 1 < headings.length) ? headings[i + 1] : null;
               try {
-                if (nextHeading) {
-                  range.setEndBefore(nextHeading);
-                } else {
-                  // end at end of container
-                  const last = container.lastChild || h;
-                  range.setEndAfter(last);
-                }
-              } catch (e) {
-                // ignore range errors
-              }
+                if (nextHeading) range.setEndBefore(nextHeading);
+                else range.setEndAfter(container.lastChild || h);
+              } catch {}
               let content = normalizeText(range.toString());
 
-              // If range gave no content, try useful fallbacks:
               if (!content) {
-                // 1) If heading sits inside an article/card, try its .uol-c-card__body
                 const cardAncestor = h.closest("article");
                 if (cardAncestor) {
                   const cbody = cardAncestor.querySelector(".uol-c-card__body");
                   if (cbody) content = normalizeText(cbody.innerText);
                 }
-                // 2) If container has a prominent summary paragraph before cards, try capturing that
                 if (!content) {
                   const p = h.nextElementSibling;
                   if (p && p.tagName && p.tagName.toLowerCase() === "p") {
@@ -358,7 +360,6 @@ class ContentScraper:
                 }
               }
 
-              // Final cleanup: strip any accidental heading repetition inside content
               if (content && content.startsWith(headingText)) {
                 content = content.substring(headingText.length).trim();
               }
@@ -371,294 +372,259 @@ class ContentScraper:
           return results;
         }
         """
-        
         try:
             result = await page.evaluate(js)
-            logger.debug("JS extraction returned %d blocks", len(result) if isinstance(result, list) else -1)
             return result or []
         except Exception:
             logger.exception("JS extraction failed")
             return []
-    
-    async def scrape_single_page(self, browser, url, semaphore):
-        """Scrape content from a single page - Same logic as working deep analysis file"""
+
+    async def _save_incremental(self, result):
+        """Persist a single page’s data to disk."""
+        async with self.lock:
+            filename = CONFIG["output"]["incremental_file"]
+            existing = []
+            if os.path.exists(filename):
+                with open(filename, "r", encoding="utf-8") as f:
+                    try:
+                        existing = json.load(f)
+                    except json.JSONDecodeError:
+                        logger.warning("Incremental file corrupt – starting fresh")
+            existing.append(result)
+            with open(filename, "w", encoding="utf-8") as f:
+                json.dump(existing, f, ensure_ascii=False, indent=2)
+
+    async def _add_failed_url(self, url, error):
+        async with self.lock:
+            self.failed_urls.append(
+                {"url": url, "error": error, "timestamp": datetime.now().isoformat()}
+            )
+
+    async def _scrape_single_page(self, context, url, semaphore):
+        """Scrape one page using the shared context."""
         async with semaphore:
-            context = None
             page = None
             try:
-                req_headers = self.build_headers(url)
-                context = await browser.new_context(
-                    user_agent=req_headers.get('User-Agent'),
-                    extra_http_headers=req_headers,
-                    locale='en-US',
-                    timezone_id='UTC'
+                # 1️⃣  Start -------------------------------------------------
+                logger.info(
+                    "STARTING: %s (%d/%d)",
+                    url,
+                    self.total_scraped + 1,
+                    self.total_to_scrape,
                 )
+
+                # 2️⃣  New page ------------------------------------------------
                 page = await context.new_page()
-                page.set_default_navigation_timeout(60000)  # Same as working file
+                page.set_default_navigation_timeout(self.config["nav_timeout"])
 
-                logger.info("Visiting %s", url)
-                
-                # Try navigation with brief retries to mitigate transient bot checks - Same as working file
-                attempts = 3
-                nav_response = None
-                for attempt in range(1, attempts + 1):
+                # 3️⃣  Navigation ------------------------------------------------
+                nav_resp = None
+                for attempt in range(1, self.config["retry_attempts"] + 1):
                     try:
-                        nav_response = await page.goto(
-                            url, wait_until="domcontentloaded", timeout=60000
+                        nav_resp = await page.goto(
+                            url, wait_until="domcontentloaded", timeout=self.config["nav_timeout"]
                         )
                     except Exception:
-                        logger.exception("Navigation attempt %d failed", attempt)
-                        nav_response = None
+                        logger.warning("Attempt %d: navigation exception for %s", attempt, url)
 
-                    # Validate navigation response
-                    ok = False
-                    try:
-                        if nav_response is not None:
-                            status_code = nav_response.status
-                            ok = isinstance(status_code, int) and status_code < 400
-                    except Exception:
-                        logger.debug("Unable to read navigation response/status", exc_info=True)
-
-                    if ok:
+                    if nav_resp and nav_resp.status < 400:
                         break
-                    if attempt < attempts:
-                        wait_ms = 1000 * attempt
-                        logger.warning(
-                            "Nav not OK (resp=%s). Retrying in %d ms...",
-                            getattr(nav_response, 'status', None), wait_ms
-                        )
-                        await page.wait_for_timeout(wait_ms)
-                        
-                # Final check
-                if nav_response is None:
-                    logger.error("No response received for URL: %s", url)
-                    await self.add_failed_url(url, "No response received")
+                    await asyncio.sleep(attempt * 1)
+
+                if nav_resp is None or nav_resp.status >= 400:
+                    err_msg = f"HTTP {nav_resp.status if nav_resp else 'N/A'}"
+                    logger.error("%s – %s", err_msg, url)
+                    await self._add_failed_url(url, err_msg)
+                    self.total_failed += 1
                     return None
-                try:
-                    status_code = nav_response.status
-                    if isinstance(status_code, int) and status_code >= 400:
-                        logger.error("HTTP %s received for URL: %s", status_code, url)
-                        await self.add_failed_url(url, f"HTTP {status_code}")
-                        return None
-                except Exception:
-                    logger.debug("Unable to read final navigation status", exc_info=True)
 
-                # give lazy JS a short time then scroll - Same timing as working file
-                await page.wait_for_timeout(800)
-                await self.auto_scroll(page)
-                # wait a bit for lazy content to load after scroll
-                await page.wait_for_timeout(1200)
+                logger.info("NAVIGATION OK: %s – %s", url, nav_resp.status)
 
-                # Extract content
-                data = await self.extract_structured_content(page)
-                
-                # per-heading log summary - Same as working file
-                logger.info("Extracted %d heading blocks", len(data))
-                for i, item in enumerate(data, start=1):
-                    heading_text = item.get("heading") or ""
-                    content_text = item.get("content") or ""
-                    logger.debug("[%d] %r (content length = %d)", i, heading_text, len(content_text))
-                
+                # 4️⃣  Wait for lazy content ---------------------------------
+                await asyncio.sleep(0.8)
+                await self._auto_scroll(page)
+                await asyncio.sleep(1.2)
+
+                # 5️⃣  Extraction ---------------------------------------------
+                blocks = await self._extract_structured_content(page)
+                logger.info("EXTRACTION OK: %s – %d heading blocks", url, len(blocks))
+
                 result = {
-                    'url': url,
-                    'title': await page.title(),
-                    'scraped_at': datetime.now().isoformat(),
-                    'content_blocks': data,
-                    'total_blocks': len(data)
+                    "url": url,
+                    "title": await page.title(),
+                    "scraped_at": datetime.now().isoformat(),
+                    "content_blocks": blocks,
+                    "total_blocks": len(blocks),
                 }
-                
-                # Save incrementally
-                if self.config.get('incremental_save', True):
-                    await self.save_incremental(result)
-                
-                logger.info("Scraped %d blocks from %s", len(data), url)
+
+                if self.config.get("incremental_save", True):
+                    await self._save_incremental(result)
+
+                self.total_scraped += 1
                 return result
 
-            except Exception as e:
-                logger.exception("Unhandled error during scrape_single_page for %s", url)
-                await self.add_failed_url(url, str(e))
+            except Exception as exc:
+                logger.exception("FAILED: %s – %s", url, exc)
+                await self._add_failed_url(url, str(exc))
+                self.total_failed += 1
                 return None
-                
+
             finally:
-                # best-effort cleanup - Same as working file
-                try:
-                    if page is not None:
-                        await page.close()
-                except Exception:
-                    logger.debug("Ignoring page.close error", exc_info=True)
-                try:
-                    if context is not None:
-                        await context.close()
-                except Exception:
-                    logger.debug("Ignoring context.close error", exc_info=True)
-    
-    async def save_incremental(self, result):
-        """Save result incrementally"""
-        async with self.lock:
-            try:
-                filename = CONFIG['output']['incremental_file']
-                
-                # Read existing data
-                existing_data = []
-                if os.path.exists(filename):
-                    with open(filename, 'r', encoding='utf-8') as f:
-                        existing_data = json.load(f)
-                
-                # Add new result
-                existing_data.append(result)
-                
-                # Write back
-                with open(filename, 'w', encoding='utf-8') as f:
-                    json.dump(existing_data, f, ensure_ascii=False, indent=2)
-                    
-            except Exception as e:
-                logger.error(f"Failed to save incremental data: {e}")
-    
-    async def add_failed_url(self, url, error):
-        """Add failed URL to tracking"""
-        async with self.lock:
-            self.failed_urls.append({
-                'url': url,
-                'error': error,
-                'timestamp': datetime.now().isoformat()
-            })
-    
+                if page:
+                    try: await page.close()
+                    except Exception: pass
+
     async def scrape_all_urls(self, urls):
-        """Scrape content from all URLs"""
-        logger.info(f"Starting content scraping for {len(urls)} URLs")
-        
-        # Limit concurrent browser instances
-        semaphore = asyncio.Semaphore(self.config['max_concurrent'])
-        
+        """Scrape every URL with a single shared context."""
+        self.total_to_scrape = len(urls)
+        logger.info("Starting content scraping for %d URLs", len(urls))
+        semaphore = asyncio.Semaphore(self.config["max_concurrent"])
+
         async with async_playwright() as p:
             browser = await p.chromium.launch(
-                headless=self.config['headless'],
-                args=["--disable-blink-features=AutomationControlled"]
+                headless=self.config["headless"],
+                args=["--disable-blink-features=AutomationControlled"],
             )
-            
+
+            # shared context (cookies survive across pages)
+            context = await browser.new_context(
+                user_agent=self._build_headers(None)["User-Agent"],
+                extra_http_headers=self._build_headers(None),
+                locale="en-US",
+                timezone_id="UTC",
+            )
+
             try:
-                tasks = []
-                for url in urls:
-                    task = self.scrape_single_page(browser, url, semaphore)
-                    tasks.append(task)
-                    
-                    # Add delay between task creation
-                    if self.config['delay_between_pages'] > 0:
-                        await asyncio.sleep(self.config['delay_between_pages'])
-                
-                # Execute all tasks
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                # Filter successful results
-                successful_results = [r for r in results if r is not None and not isinstance(r, Exception)]
-                
-                logger.info(f"Successfully scraped {len(successful_results)} out of {len(urls)} URLs")
-                
-                return successful_results
-                
+                tasks = [
+                    asyncio.create_task(
+                        self._scrape_single_page(context, u, semaphore)
+                    )
+                    for u in urls
+                ]
+
+                # Create tasks with a slight delay to avoid burst requests
+                for fut in asyncio.as_completed(tasks):
+                    try:
+                        await fut
+                    except asyncio.CancelledError:
+                        logger.warning("Task cancelled – user interrupted")
+                        raise
+                    except Exception as exc:
+                        logger.exception("Unexpected exception: %s", exc)
+
+                logger.info(
+                    "Scraping finished – %d succeeded, %d failed",
+                    self.total_scraped,
+                    self.total_failed,
+                )
+                return [t.result() for t in tasks if t.result() is not None]
+
             finally:
+                await context.close()
                 await browser.close()
 
-
+# --------------------------------------------------------------------
+#  COMBINED SCRAPER
+# --------------------------------------------------------------------
 class CombinedScraper:
-    """Main class that combines URL extraction and content scraping"""
-    
     def __init__(self, config=None):
         self.config = config or CONFIG
-        self.url_extractor = URLExtractor(self.config['url_extraction'])
-        self.content_scraper = ContentScraper(self.config['content_scraping'])
-    
+        self.url_extractor = URLExtractor(self.config["url_extraction"])
+        self.content_scraper = ContentScraper(self.config["content_scraping"])
+
     async def scrape_domain(self, start_url):
-        """Main method to scrape entire domain"""
-        logger.info("="*60)
+        logger.info("=" * 60)
         logger.info(">> COMBINED DOMAIN SCRAPER STARTED")
-        logger.info("="*60)
-        logger.info(f"Target URL: {start_url}")
-        
+        logger.info("=" * 60)
+        logger.info("Target URL: %s", start_url)
+
         start_time = time.time()
-        
-        # Step 1: Extract all URLs
-        logger.info("\n" + "="*40)
+
+        # --------------------------------------------------------------------
+        # 1️⃣  URL EXTRACTION
+        # --------------------------------------------------------------------
+        logger.info("\n" + "=" * 40)
         logger.info("STEP 1: EXTRACTING URLs")
-        logger.info("="*40)
-        
+        logger.info("=" * 40)
+
         urls = self.url_extractor.extract_all_urls(start_url)
-        
+
         if not urls:
             logger.error("No URLs found. Exiting.")
             return
-        
-        logger.info(f"Found {len(urls)} URLs to scrape")
-        
-        # Step 2: Scrape content from all URLs
-        logger.info("\n" + "="*40)
+
+        logger.info("Found %d URLs to scrape", len(urls))
+
+        # --------------------------------------------------------------------
+        # 2️⃣  CONTENT SCRAPING
+        # --------------------------------------------------------------------
+        logger.info("\n" + "=" * 40)
         logger.info("STEP 2: SCRAPING CONTENT")
-        logger.info("="*40)
-        
-        scraped_results = await self.content_scraper.scrape_all_urls(urls)
-        
-        # Step 3: Save final results
-        logger.info("\n" + "="*40)
+        logger.info("=" * 40)
+
+        scraped = await self.content_scraper.scrape_all_urls(urls)
+
+        # --------------------------------------------------------------------
+        # 3️⃣  SAVE FINAL RESULTS
+        # --------------------------------------------------------------------
+        logger.info("\n" + "=" * 40)
         logger.info("STEP 3: SAVING RESULTS")
-        logger.info("="*40)
-        
-        final_data = {
-            'domain': urlparse(start_url).netloc,
-            'start_url': start_url,
-            'scraping_started': datetime.now().isoformat(),
-            'total_urls_found': len(urls),
-            'successfully_scraped': len(scraped_results),
-            'failed_urls': len(self.content_scraper.failed_urls),
-            'results': scraped_results
+        logger.info("=" * 40)
+
+        final = {
+            "domain": urlparse(start_url).netloc,
+            "start_url": start_url,
+            "scraping_started": datetime.now().isoformat(),
+            "total_urls_found": len(urls),
+            "successfully_scraped": len(scraped),
+            "failed_urls": len(self.content_scraper.failed_urls),
+            "results": scraped,
         }
-        
-        # Save final consolidated data
-        final_file = self.config['output']['final_file']
-        with open(final_file, 'w', encoding='utf-8') as f:
-            json.dump(final_data, f, ensure_ascii=False, indent=2)
-        
-        # Save failed URLs
+
+        final_file = self.config["output"]["final_file"]
+        with open(final_file, "w", encoding="utf-8") as f:
+            json.dump(final, f, ensure_ascii=False, indent=2)
+
         if self.content_scraper.failed_urls:
-            failed_file = self.config['output']['failed_urls_file']
-            with open(failed_file, 'w', encoding='utf-8') as f:
+            failed_file = self.config["output"]["failed_urls_file"]
+            with open(failed_file, "w", encoding="utf-8") as f:
                 json.dump(self.content_scraper.failed_urls, f, ensure_ascii=False, indent=2)
-        
-        # Final statistics
+
         total_time = time.time() - start_time
-        total_content_blocks = sum(len(result.get('content_blocks', [])) for result in scraped_results)
-        
-        logger.info("="*60)
+        total_blocks = sum(r["total_blocks"] for r in scraped)
+
+        logger.info("=" * 60)
         logger.info(">> SCRAPING COMPLETE")
-        logger.info("="*60)
-        logger.info(f"Total time: {total_time:.2f}s")
-        logger.info(f"URLs found: {len(urls)}")
-        logger.info(f"Successfully scraped: {len(scraped_results)}")
-        logger.info(f"Failed: {len(self.content_scraper.failed_urls)}")
-        logger.info(f"Total content blocks: {total_content_blocks}")
-        logger.info(f"Final results saved to: {final_file}")
-        
+        logger.info("=" * 60)
+        logger.info("Total time: %.2fs", total_time)
+        logger.info("URLs found: %d", len(urls))
+        logger.info("Successfully scraped: %d", len(scraped))
+        logger.info("Failed: %d", len(self.content_scraper.failed_urls))
+        logger.info("Total content blocks: %d", total_blocks)
+        logger.info("Final results saved to: %s", final_file)
+
         if self.content_scraper.failed_urls:
-            logger.info(f"Failed URLs saved to: {failed_file}")
-        
-        return final_data
+            logger.info("Failed URLs saved to: %s", failed_file)
 
+        return final
 
+# --------------------------------------------------------------------
+#  MAIN
+# --------------------------------------------------------------------
 async def main():
-    """Main function"""
-    # Configure the target URL here
     START_URL = "https://www.tanyapepsodent.com/"
-    
-    # You can modify the configuration here if needed
-    scraper = CombinedScraper(CONFIG)
-    
-    try:
-        results = await scraper.scrape_domain(START_URL)
-        return results
-    except KeyboardInterrupt:
-        logger.info("Scraping interrupted by user")
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}", exc_info=True)
 
+    scraper = CombinedScraper(CONFIG)
+
+    try:
+        await scraper.scrape_domain(START_URL)
+    except KeyboardInterrupt:
+        logger.info("Scraping interrupted by user (Ctrl‑C)")
+    except Exception as exc:
+        logger.exception("Unexpected error: %s", exc)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Scraping cancelled from the outside")
