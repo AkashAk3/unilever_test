@@ -180,8 +180,8 @@ class ParallelURLExtractor:
         return self.all_urls
 
 def main():
-    start_url = "https://www.unilever.com/"
-    start_url = "https://www.degreedeodorant.com/us/en/home.html"
+    # start_url = "https://www.unilever.com/"
+    # start_url = "https://www.degreedeodorant.com/us/en/home.html"
     # start_url="http://quebrandobarreiras.rexona.com.br/"
     start_url= "https://www.tanyapepsodent.com/"
     # start_url ="https://breakinglimits.degreedeodorant.com/en-US"
